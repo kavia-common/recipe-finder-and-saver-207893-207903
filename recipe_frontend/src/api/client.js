@@ -5,6 +5,29 @@
 
 const DEFAULT_TIMEOUT_MS = 20000;
 
+const TOKEN_STORAGE_KEY = 'rf_access_token';
+
+// PUBLIC_INTERFACE
+export function getAccessToken() {
+  /** Return the currently stored JWT access token (or empty string). */
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+// PUBLIC_INTERFACE
+export function setAccessToken(token) {
+  /** Persist a JWT access token for subsequent API calls. */
+  try {
+    if (!token) window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    else window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // ignore storage failures (e.g., privacy mode)
+  }
+}
+
 /**
  * @returns {string}
  */
@@ -54,11 +77,14 @@ async function request(method, path, options = {}) {
   const { body, headers, timeoutMs } = options;
   const { signal, cleanup } = makeAbortSignal(timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
+  const token = getAccessToken();
+
   try {
     const res = await fetch(urlFor(path), {
       method,
       headers: {
         ...(body ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(headers || {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -89,6 +115,42 @@ async function request(method, path, options = {}) {
 export async function apiGetHealth() {
   /** Health check. Returns {} or any JSON payload. */
   return request('GET', '/');
+}
+
+// PUBLIC_INTERFACE
+export async function apiRegister({ email, password, display_name }) {
+  /** Register a new user and store returned JWT. */
+  const data = await request('POST', '/auth/register', {
+    body: { email, password, display_name: display_name || null },
+  });
+  if (data?.access_token) setAccessToken(data.access_token);
+  return data;
+}
+
+// PUBLIC_INTERFACE
+export async function apiLogin({ email, password }) {
+  /** Login and store returned JWT. */
+  const data = await request('POST', '/auth/login', { body: { email, password } });
+  if (data?.access_token) setAccessToken(data.access_token);
+  return data;
+}
+
+// PUBLIC_INTERFACE
+export async function apiGetMe() {
+  /** Fetch the current user profile using the stored JWT. */
+  return request('GET', '/auth/me');
+}
+
+// PUBLIC_INTERFACE
+export async function apiLogout() {
+  /** Logout is client-side for JWT-based auth. */
+  setAccessToken('');
+  try {
+    return await request('POST', '/auth/logout');
+  } catch (e) {
+    // Backend logout is convenience-only; ignore failures.
+    return { message: 'Logged out' };
+  }
 }
 
 /**
@@ -127,10 +189,13 @@ export async function apiGetRecipeById(id) {
  */
 // PUBLIC_INTERFACE
 export async function apiGetSavedRecipes({ username } = {}) {
-  /** Get saved/favorite recipes list. */
+  /** Get saved/favorite recipes list. (username is ignored by this backend; kept for backward compatibility) */
   const qs = username ? `?username=${encodeURIComponent(username)}` : '';
   try {
-    return await request('GET', `/favorites${qs}`);
+    const data = await request('GET', `/favorites${qs}`);
+    // Backend returns { items: [{ recipe, created_at }], total }
+    if (data && Array.isArray(data.items)) return data.items.map((it) => it.recipe);
+    return data;
   } catch (e) {
     return request('GET', `/saved${qs}`);
   }
@@ -145,18 +210,21 @@ export async function apiGetSavedRecipes({ username } = {}) {
  */
 // PUBLIC_INTERFACE
 export async function apiSaveRecipe(recipe, { username } = {}) {
-  /** Save/favorite a recipe. */
-  const body = username ? { username, recipe } : { recipe };
+  /** Save/favorite a recipe. This backend requires Bearer JWT and expects { recipe_id }. */
+  const recipeId = recipe?.id ?? recipe?.recipe_id ?? recipe?._id ?? recipe?.uuid;
+  if (!recipeId) throw new Error('Cannot save recipe: missing recipe id.');
+
+  // username is ignored by backend; kept for backward compatibility.
+  const body = { recipe_id: String(recipeId) };
 
   try {
     return await request('POST', '/favorites', { body });
   } catch (e) {
-    // Fallback variants
+    // Fallback variants for older backends
     try {
-      return await request('POST', '/saved', { body });
+      return await request('POST', '/saved', { body: username ? { username, recipe } : { recipe } });
     } catch (e2) {
-      // Some backends might accept recipe directly at /favorites
-      return request('POST', '/favorites', { body: username ? { ...recipe, username } : recipe });
+      throw e;
     }
   }
 }

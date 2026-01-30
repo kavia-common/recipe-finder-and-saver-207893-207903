@@ -7,6 +7,11 @@ import {
   apiGetSavedRecipes,
   apiSaveRecipe,
   apiUnsaveRecipe,
+  apiLogin,
+  apiRegister,
+  apiGetMe,
+  apiLogout,
+  getAccessToken,
 } from './api/client';
 
 /**
@@ -164,9 +169,17 @@ function Modal({ title, children, onClose }) {
 function App() {
   const [theme, setTheme] = useState('light');
 
-  // Basic "auth" placeholder: backend may evolve to real auth later.
-  // We keep a username in localStorage so saved recipes feel personal.
+  // Auth (JWT). We still keep an optional "username" purely as a display handle in the UI.
   const [username, setUsername] = useState(() => window.localStorage.getItem('rf_username') || '');
+
+  const [auth, setAuth] = useState(() => ({
+    token: getAccessToken(),
+    user: null,
+    status: 'idle', // idle | loading | authed | error
+    error: '',
+  }));
+
+  const [authForm, setAuthForm] = useState({ email: '', password: '', displayName: '' });
 
   // Search state
   const [query, setQuery] = useState('');
@@ -198,7 +211,7 @@ function App() {
 
   const savedIds = useMemo(() => new Set(saved.map((r) => normalizeRecipe(r).id)), [saved]);
 
-  // Initial backend health check + load saved
+  // Initial backend health check + auth bootstrap + load saved
   useEffect(() => {
     let cancelled = false;
 
@@ -210,8 +223,19 @@ function App() {
         if (!cancelled) setHealth({ ok: false, error: toErrorMessage(e) });
       }
 
-      // Saved list is optional but central to the app experience.
-      // Load it even if health check fails; backend may still respond.
+      // If we already have a token, resolve /me so UI can show logged-in state.
+      const token = getAccessToken();
+      if (token) {
+        try {
+          if (!cancelled) setAuth((a) => ({ ...a, status: 'loading', error: '' }));
+          const me = await apiGetMe();
+          if (!cancelled) setAuth({ token, user: me?.user || null, status: 'authed', error: '' });
+        } catch (e) {
+          if (!cancelled) setAuth({ token: '', user: null, status: 'error', error: toErrorMessage(e) });
+        }
+      }
+
+      // Load saved favorites (requires auth; will show an error pill if not logged in)
       reloadSaved();
     }
 
@@ -266,8 +290,16 @@ function App() {
       setSaved(normalized);
       setSavedStatus({ loading: false, error: '', lastUpdated: new Date().toISOString() });
     } catch (e) {
+      const msg = toErrorMessage(e);
       setSaved([]);
-      setSavedStatus({ loading: false, error: toErrorMessage(e), lastUpdated: '' });
+      // If not authenticated, show a friendly prompt.
+      setSavedStatus({
+        loading: false,
+        error: msg.includes('401') || msg.toLowerCase().includes('not authenticated')
+          ? 'Login required to view favorites.'
+          : msg,
+        lastUpdated: '',
+      });
     }
   }
 
@@ -363,6 +395,58 @@ function App() {
               </span>
             </div>
 
+            <div className="rf-connection" title="Authentication status">
+              <span
+                className={classNames('rf-dot', auth.status === 'authed' ? 'rf-dot--ok' : 'rf-dot--bad')}
+                aria-hidden="true"
+              />
+              <span className="rf-connection__text">
+                {auth.status === 'authed' && auth.user?.email ? `Signed in: ${auth.user.email}` : 'Signed out'}
+              </span>
+            </div>
+
+            {auth.status === 'authed' ? (
+              <button
+                className="rf-btn rf-btn--secondary"
+                type="button"
+                onClick={async () => {
+                  await apiLogout();
+                  setAuth({ token: '', user: null, status: 'idle', error: '' });
+                  reloadSaved();
+                }}
+              >
+                Logout
+              </button>
+            ) : (
+              <button
+                className="rf-btn rf-btn--secondary"
+                type="button"
+                onClick={async () => {
+                  setAuth((a) => ({ ...a, status: 'loading', error: '' }));
+                  try {
+                    // Default: login if email exists; else do nothing.
+                    if (!authForm.email.trim() || !authForm.password) {
+                      setAuth((a) => ({ ...a, status: 'error', error: 'Enter email + password below.' }));
+                      return;
+                    }
+                    const data = await apiLogin({ email: authForm.email.trim(), password: authForm.password });
+                    const me = await apiGetMe();
+                    setAuth({
+                      token: data?.access_token || '',
+                      user: me?.user || data?.user || null,
+                      status: 'authed',
+                      error: '',
+                    });
+                    reloadSaved();
+                  } catch (e) {
+                    setAuth({ token: '', user: null, status: 'error', error: toErrorMessage(e) });
+                  }
+                }}
+              >
+                Login
+              </button>
+            )}
+
             <button
               className="rf-btn rf-btn--secondary"
               onClick={toggleTheme}
@@ -438,36 +522,146 @@ function App() {
 
             <div className="rf-block">
               <h2 className="rf-h2">Pilot profile</h2>
-              <p className="rf-muted">Saved recipes can be filtered by your handle (optional).</p>
+              <p className="rf-muted">
+                Favorites are tied to your account (JWT). Create an account or login to save recipes.
+              </p>
 
-              <label className="rf-label" htmlFor="rf-user">
-                Username (optional)
-              </label>
-              <div className="rf-search__row">
-                <input
-                  id="rf-user"
-                  className="rf-input"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. pixelchef42"
-                  autoComplete="off"
-                />
-                <button className="rf-btn rf-btn--secondary" type="button" onClick={reloadSaved}>
-                  Reload saved
-                </button>
-              </div>
+              <div className="rf-grid2">
+                <div className="rf-block">
+                  <label className="rf-label" htmlFor="rf-email">
+                    Email
+                  </label>
+                  <input
+                    id="rf-email"
+                    className="rf-input"
+                    value={authForm.email}
+                    onChange={(e) => setAuthForm((f) => ({ ...f, email: e.target.value }))}
+                    placeholder="you@example.com"
+                    autoComplete="email"
+                  />
 
-              <div className="rf-statusRow" role="status" aria-live="polite">
-                {savedStatus.loading ? (
-                  <span className="rf-pill rf-pill--loading">Loading saved…</span>
-                ) : savedStatus.error ? (
-                  <span className="rf-pill rf-pill--error">Error: {savedStatus.error}</span>
-                ) : (
-                  <span className="rf-pill rf-pill--ok">
-                    {saved.length} saved
-                    {savedStatus.lastUpdated ? ` • ${formatTime(savedStatus.lastUpdated)}` : ''}
-                  </span>
-                )}
+                  <label className="rf-label" htmlFor="rf-pass">
+                    Password
+                  </label>
+                  <input
+                    id="rf-pass"
+                    className="rf-input"
+                    type="password"
+                    value={authForm.password}
+                    onChange={(e) => setAuthForm((f) => ({ ...f, password: e.target.value }))}
+                    placeholder="••••••"
+                    autoComplete="current-password"
+                  />
+
+                  <label className="rf-label" htmlFor="rf-display">
+                    Display name (optional)
+                  </label>
+                  <input
+                    id="rf-display"
+                    className="rf-input"
+                    value={authForm.displayName}
+                    onChange={(e) => setAuthForm((f) => ({ ...f, displayName: e.target.value }))}
+                    placeholder="PixelChef"
+                    autoComplete="nickname"
+                  />
+
+                  <div className="rf-search__row">
+                    <button
+                      className="rf-btn rf-btn--primary"
+                      type="button"
+                      disabled={auth.status === 'loading'}
+                      onClick={async () => {
+                        setAuth((a) => ({ ...a, status: 'loading', error: '' }));
+                        try {
+                          const data = await apiRegister({
+                            email: authForm.email.trim(),
+                            password: authForm.password,
+                            display_name: authForm.displayName.trim() || null,
+                          });
+                          const me = await apiGetMe();
+                          setAuth({
+                            token: data?.access_token || '',
+                            user: me?.user || data?.user || null,
+                            status: 'authed',
+                            error: '',
+                          });
+                          reloadSaved();
+                        } catch (e) {
+                          setAuth({ token: '', user: null, status: 'error', error: toErrorMessage(e) });
+                        }
+                      }}
+                    >
+                      Register
+                    </button>
+
+                    <button
+                      className="rf-btn rf-btn--secondary"
+                      type="button"
+                      disabled={auth.status === 'loading'}
+                      onClick={async () => {
+                        setAuth((a) => ({ ...a, status: 'loading', error: '' }));
+                        try {
+                          const data = await apiLogin({ email: authForm.email.trim(), password: authForm.password });
+                          const me = await apiGetMe();
+                          setAuth({
+                            token: data?.access_token || '',
+                            user: me?.user || data?.user || null,
+                            status: 'authed',
+                            error: '',
+                          });
+                          reloadSaved();
+                        } catch (e) {
+                          setAuth({ token: '', user: null, status: 'error', error: toErrorMessage(e) });
+                        }
+                      }}
+                    >
+                      Login
+                    </button>
+                  </div>
+
+                  {auth.status === 'error' && auth.error ? (
+                    <div className="rf-callout rf-callout--warn">
+                      <div className="rf-callout__title">Auth error</div>
+                      <div className="rf-callout__body">
+                        <div className="rf-mono">{auth.error}</div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="rf-block">
+                  <p className="rf-muted">Optional handle (UI-only)</p>
+
+                  <label className="rf-label" htmlFor="rf-user">
+                    Username (optional)
+                  </label>
+                  <div className="rf-search__row">
+                    <input
+                      id="rf-user"
+                      className="rf-input"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      placeholder="e.g. pixelchef42"
+                      autoComplete="off"
+                    />
+                    <button className="rf-btn rf-btn--secondary" type="button" onClick={reloadSaved}>
+                      Reload favorites
+                    </button>
+                  </div>
+
+                  <div className="rf-statusRow" role="status" aria-live="polite">
+                    {savedStatus.loading ? (
+                      <span className="rf-pill rf-pill--loading">Loading favorites…</span>
+                    ) : savedStatus.error ? (
+                      <span className="rf-pill rf-pill--error">Error: {savedStatus.error}</span>
+                    ) : (
+                      <span className="rf-pill rf-pill--ok">
+                        {saved.length} favorite{saved.length === 1 ? '' : 's'}
+                        {savedStatus.lastUpdated ? ` • ${formatTime(savedStatus.lastUpdated)}` : ''}
+                      </span>
+                    )}
+                  </div>
+                </div>
               </div>
 
               {!health.ok && health.error ? (
